@@ -1,0 +1,333 @@
+#!/usr/bin/env python3
+"""Re-apply the howdoi fixes after `brew upgrade` / `brew reinstall howdoi`.
+
+howdoi 2.0.20 scrapes Google + StackOverflow, and both now block non-browser
+clients: Google serves an "update your browser" page and StackOverflow returns a
+Cloudflare bot challenge (HTTP 403). This patch:
+
+  1. rewires howdoi to the official StackExchange API for both the search and the
+     answer bodies. A registered StackApps request key raises the daily API quota
+     from 300 to 10,000; it is read from $HOWDOI_STACKAPPS_KEY, or from
+     ~/.config/howdoi/key.
+  2. falls back to Tavily's keyless web search when the StackExchange search finds
+     nothing.
+  3. makes `-j/--json` always emit valid JSON, including error responses.
+  4. fixes the stash (`--save/--view/--remove/--empty`), which crashed because it
+     shelled out to the unbundled `keep` CLI.
+
+Idempotent: running it when already patched is a no-op. It also upgrades a file
+that only carries the older API-only patch.
+
+Usage: howdoi-fix [path-to-howdoi.py]
+"""
+import glob
+import os
+import subprocess
+import sys
+
+# --- 1. import time ---------------------------------------------------------
+ORIG_IMPORT = "import sys\nimport textwrap\n"
+NEW_IMPORT = "import sys\nimport textwrap\nimport time\n"
+
+# --- 2. StackExchange API: _se_api (+ key support, graceful errors) ---------
+#         and the API-backed _get_result.
+SE_API_ORIG = '''def _se_api(path, params):
+    url = 'https://api.stackexchange.com/2.3/' + path
+    resp = howdoi_session.get(url, params=params,
+                              headers={'User-Agent': _random_choice(USER_AGENTS)},
+                              proxies=get_proxies(),
+                              timeout=30)
+    resp.raise_for_status()
+    data = resp.json()
+    if data.get('backoff'):
+        time.sleep(data['backoff'])
+    return data
+'''
+
+SE_API_KEY_V1 = '''def _se_api(path, params):
+    url = 'https://api.stackexchange.com/2.3/' + path
+    api_key = os.getenv('HOWDOI_STACKAPPS_KEY')
+    if not api_key:
+        key_file = os.path.expanduser('~/.config/howdoi/key')
+        if os.path.exists(key_file):
+            with open(key_file) as handle:
+                api_key = handle.read().strip()
+    if api_key:
+        params = dict(params, key=api_key)
+    resp = howdoi_session.get(url, params=params,
+                              headers={'User-Agent': _random_choice(USER_AGENTS)},
+                              proxies=get_proxies(),
+                              timeout=30)
+    resp.raise_for_status()
+    data = resp.json()
+    if data.get('backoff'):
+        time.sleep(data['backoff'])
+    return data
+'''
+
+SE_API_KEY = '''def _se_api(path, params):
+    url = 'https://api.stackexchange.com/2.3/' + path
+    api_key = os.getenv('HOWDOI_STACKAPPS_KEY')
+    if not api_key:
+        key_file = os.path.expanduser('~/.config/howdoi/key')
+        if os.path.exists(key_file):
+            with open(key_file) as handle:
+                api_key = handle.read().strip()
+    if api_key:
+        params = dict(params, key=api_key)
+    resp = howdoi_session.get(url, params=params,
+                              headers={'User-Agent': _random_choice(USER_AGENTS)},
+                              proxies=get_proxies(),
+                              timeout=30)
+    try:
+        resp.raise_for_status()
+    except requests.exceptions.HTTPError:
+        try:
+            detail = resp.json().get('error_message', resp.text)
+        except ValueError:
+            detail = resp.text
+        logging.error('%sStackExchange API error: %s%s', RED, detail, END_FORMAT)
+        return {}
+    data = resp.json()
+    if data.get('backoff'):
+        time.sleep(data['backoff'])
+    return data
+'''
+
+ORIG_GET_RESULT = """def _get_result(url):
+    try:
+        resp = howdoi_session.get(url, headers={'User-Agent': _random_choice(USER_AGENTS)},
+                                  proxies=get_proxies(),
+                                  verify=VERIFY_SSL_CERTIFICATE,
+                                  cookies={'CONSENT': 'YES+US.en+20170717-00-0'})
+        resp.raise_for_status()
+        return resp.text
+"""
+
+GET_RESULT_BODY = '''def _get_result(url):
+    parsed = urlparse(url)
+    # StackOverflow answers non-browser clients with a Cloudflare challenge, so read
+    # question pages from the official StackExchange API and rebuild the markup that
+    # the answer parser below expects.
+    if parsed.netloc.endswith('stackoverflow.com') and '/questions/' in parsed.path:
+        question_id = re.search(r'/questions/(\\d+)', parsed.path).group(1)
+        data = _se_api(
+            f'questions/{question_id}/answers',
+            {'order': 'desc', 'sort': 'votes', 'site': 'stackoverflow',
+             'filter': 'withbody', 'pagesize': '30'},
+        )
+        cells = []
+        for answer in data.get('items', []):
+            cells.append('<div class="answercell"><div class="js-post-body">'
+                         + answer.get('body', '') + '</div></div>')
+        return ''.join(cells)
+
+    try:
+        resp = howdoi_session.get(url, headers={'User-Agent': _random_choice(USER_AGENTS)},
+                                  proxies=get_proxies(),
+                                  verify=VERIFY_SSL_CERTIFICATE,
+                                  cookies={'CONSENT': 'YES+US.en+20170717-00-0'})
+        resp.raise_for_status()
+        return resp.text
+'''
+
+NEW_GET_RESULT = SE_API_KEY + "\n\n" + GET_RESULT_BODY
+
+# --- 3. _get_links: StackExchange search + Tavily keyless fallback ----------
+ORIG_GET_LINKS = """def _get_links(query):
+    search_engine = os.getenv('HOWDOI_SEARCH_ENGINE', 'google')
+    search_url = _get_search_url(search_engine).format(URL, url_quote(query))
+
+    logging.info('Searching %s with URL: %s', search_engine, search_url)
+
+    try:
+        result = _get_result(search_url)
+    except requests.HTTPError:
+        logging.info('Received HTTPError')
+        result = None
+    if not result or _is_blocked(result):
+        logging.error('%sUnable to find an answer because the search engine temporarily blocked the request. '
+                      'Attempting to use a different search engine.%s', RED, END_FORMAT)
+        raise BlockError('Temporary block by search engine')
+
+    html = pq(result)
+    links = _extract_links(html, search_engine)
+    if len(links) == 0:
+        logging.info('Search engine %s found no StackOverflow links, returned HTML is:', search_engine)
+        logging.info(result)
+    return list(dict.fromkeys(links))  # remove any duplicates
+"""
+
+GET_LINKS_V1 = """def _get_links(query):
+    # Search StackOverflow through the official API instead of scraping a search
+    # engine, which now blocks non-browser clients.
+    data = _se_api('search/advanced',
+                   {'order': 'desc', 'sort': 'relevance', 'q': query,
+                    'site': 'stackoverflow', 'pagesize': '10'})
+    links = [item['link'] for item in data.get('items', []) if item.get('is_answered')]
+    return list(dict.fromkeys(links))  # remove any duplicates
+"""
+
+NEW_GET_LINKS = """def _is_stackoverflow_question(url):
+    parsed = urlparse(url)
+    return parsed.netloc.endswith('stackoverflow.com') and '/questions/' in parsed.path
+
+
+def _tavily_links(query):
+    # Fall back to a web search when the StackExchange API search finds nothing.
+    # Tavily's keyless mode needs no account or API key.
+    try:
+        resp = howdoi_session.post(
+            'https://api.tavily.com/search',
+            json={'query': 'site:stackoverflow.com ' + query, 'max_results': 10},
+            headers={'X-Tavily-Access-Mode': 'keyless'},
+            proxies=get_proxies(),
+            timeout=30)
+        resp.raise_for_status()
+    except requests.exceptions.RequestException:
+        logging.info('Tavily fallback search failed')
+        return []
+    return [item['url'] for item in resp.json().get('results', [])
+            if _is_stackoverflow_question(item.get('url', ''))]
+
+
+def _get_links(query):
+    # Search StackOverflow through the official API instead of scraping a search
+    # engine, which now blocks non-browser clients.
+    data = _se_api('search/advanced',
+                   {'order': 'desc', 'sort': 'relevance', 'q': query,
+                    'site': 'stackoverflow', 'pagesize': '10'})
+    links = [item['link'] for item in data.get('items', []) if item.get('is_answered')]
+    links = list(dict.fromkeys(links))  # remove any duplicates
+    if not links:
+        logging.info('StackExchange API search found no answers; trying Tavily fallback')
+        links = _tavily_links(query)
+    return links
+"""
+
+# --- 4. _format_answers: always emit valid JSON for `-j` --------------------
+ORIG_FORMAT_ANSWERS = '''def _format_answers(args, res):
+    if "error" in res:
+        return f'ERROR: {RED}{res["error"]}{END_FORMAT}'
+
+    if args["json_output"]:
+        return json.dumps(res)
+
+    formatted_answers = []
+'''
+
+NEW_FORMAT_ANSWERS = '''def _format_answers(args, res):
+    if args["json_output"]:
+        return json.dumps(res)
+
+    if "error" in res:
+        return f'ERROR: {RED}{res["error"]}{END_FORMAT}'
+
+    formatted_answers = []
+'''
+
+# --- 5. stash save: create ~/.keep instead of shelling out to `keep` --------
+ORIG_STASH_SAVE = '''def _stash_save(cmd_key, title, answer):
+    try:
+        keep_utils.save_command(cmd_key, answer, title)
+    except FileNotFoundError:
+        os.system('keep init')
+        keep_utils.save_command(cmd_key, answer, title)
+    finally:
+        print_stash()
+'''
+
+NEW_STASH_SAVE = '''def _stash_save(cmd_key, title, answer):
+    os.makedirs(keep_utils.dir_path, exist_ok=True)
+    keep_utils.save_command(cmd_key, answer, title)
+    print_stash()
+
+
+def _stash_empty():
+    commands = keep_utils.read_commands()
+    if not commands:
+        logging.error('%sNo commands found in stash. '
+                      'Add a command with "howdoi --%s <query>".%s', RED, STASH_SAVE, END_FORMAT)
+        return
+    prompt = f'{BOLD}> Empty the entire stash? [y/N]: {END_FORMAT}'
+    if input(prompt).strip().lower() not in ('y', 'yes'):
+        return
+    keep_utils.write_commands({})
+    print(f'\\n{BOLD}{GREEN}Stash emptied{END_FORMAT}\\n')
+'''
+
+# --- 6. --empty handler -----------------------------------------------------
+ORIG_EMPTY = """    if args[STASH_EMPTY]:
+        os.system('keep init')
+        return
+"""
+
+NEW_EMPTY = """    if args[STASH_EMPTY]:
+        _stash_empty()
+        return
+"""
+
+
+def find_target():
+    if len(sys.argv) > 1:
+        if sys.argv[1] in ('-h', '--help'):
+            print(__doc__.strip())
+            sys.exit(0)
+        return sys.argv[1]
+    if os.environ.get('HOWDOI_PY'):
+        return os.environ['HOWDOI_PY']
+    prefix = subprocess.check_output(['brew', '--prefix', 'howdoi'], text=True).strip()
+    matches = glob.glob(os.path.join(prefix, 'libexec/lib/python*/site-packages/howdoi/howdoi.py'))
+    if not matches:
+        sys.exit('Could not find howdoi.py under ' + prefix)
+    return matches[0]
+
+
+def write_source(path, src):
+    tmp = path + '.howdoi-fix.tmp'
+    with open(tmp, 'w') as handle:
+        handle.write(src)
+    os.replace(tmp, path)
+
+
+def apply_block(src, path, name, new, olds):
+    if new in src:
+        return src
+    for old in olds:
+        if old in src:
+            return src.replace(old, new, 1)
+    sys.exit('Unexpected howdoi source (missing %s); aborting: %s' % (name, path))
+
+
+def main():
+    path = find_target()
+    with open(path) as handle:
+        src = handle.read()
+
+    if NEW_GET_LINKS in src and NEW_STASH_SAVE in src and NEW_FORMAT_ANSWERS in src:
+        print('Already patched: ' + path)
+        return
+
+    src = apply_block(src, path, 'imports', NEW_IMPORT, (ORIG_IMPORT,))
+
+    if SE_API_KEY not in src:
+        if SE_API_ORIG in src:
+            src = src.replace(SE_API_ORIG, SE_API_KEY, 1)
+        elif SE_API_KEY_V1 in src:
+            src = src.replace(SE_API_KEY_V1, SE_API_KEY, 1)
+        elif ORIG_GET_RESULT in src:
+            src = src.replace(ORIG_GET_RESULT, NEW_GET_RESULT, 1)
+        else:
+            sys.exit('Unexpected howdoi source (missing _se_api/_get_result); aborting: ' + path)
+
+    src = apply_block(src, path, '_get_links', NEW_GET_LINKS, (GET_LINKS_V1, ORIG_GET_LINKS))
+    src = apply_block(src, path, '_format_answers', NEW_FORMAT_ANSWERS, (ORIG_FORMAT_ANSWERS,))
+    src = apply_block(src, path, '_stash_save', NEW_STASH_SAVE, (ORIG_STASH_SAVE,))
+    src = apply_block(src, path, '--empty', NEW_EMPTY, (ORIG_EMPTY,))
+
+    write_source(path, src)
+    print('Patched: ' + path)
+
+
+if __name__ == '__main__':
+    main()
