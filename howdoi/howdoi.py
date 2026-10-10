@@ -18,6 +18,7 @@ import os
 import re
 import sys
 import textwrap
+import time
 
 from urllib.request import getproxies
 from urllib.parse import quote as url_quote, urlparse, parse_qs
@@ -174,7 +175,53 @@ def get_proxies():
     return filtered_proxies
 
 
+def _se_api(path, params):
+    url = 'https://api.stackexchange.com/2.3/' + path
+    api_key = os.getenv('HOWDOI_STACKAPPS_KEY')
+    if not api_key:
+        key_file = os.path.expanduser('~/.config/howdoi/key')
+        if os.path.exists(key_file):
+            with open(key_file) as handle:
+                api_key = handle.read().strip()
+    if api_key:
+        params = dict(params, key=api_key)
+    resp = howdoi_session.get(url, params=params,
+                              headers={'User-Agent': _random_choice(USER_AGENTS)},
+                              proxies=get_proxies(),
+                              timeout=30)
+    try:
+        resp.raise_for_status()
+    except requests.exceptions.HTTPError:
+        try:
+            detail = resp.json().get('error_message', resp.text)
+        except ValueError:
+            detail = resp.text
+        logging.error('%sStackExchange API error: %s%s', RED, detail, END_FORMAT)
+        return {}
+    data = resp.json()
+    if data.get('backoff'):
+        time.sleep(data['backoff'])
+    return data
+
+
 def _get_result(url):
+    parsed = urlparse(url)
+    # StackOverflow answers non-browser clients with a Cloudflare challenge, so read
+    # question pages from the official StackExchange API and rebuild the markup that
+    # the answer parser below expects.
+    if parsed.netloc.endswith('stackoverflow.com') and '/questions/' in parsed.path:
+        question_id = re.search(r'/questions/(\d+)', parsed.path).group(1)
+        data = _se_api(
+            f'questions/{question_id}/answers',
+            {'order': 'desc', 'sort': 'votes', 'site': 'stackoverflow',
+             'filter': 'withbody', 'pagesize': '30'},
+        )
+        cells = []
+        for answer in data.get('items', []):
+            cells.append('<div class="answercell"><div class="js-post-body">'
+                         + answer.get('body', '') + '</div></div>')
+        return ''.join(cells)
+
     try:
         resp = howdoi_session.get(url, headers={'User-Agent': _random_choice(USER_AGENTS)},
                                   proxies=get_proxies(),
@@ -279,26 +326,12 @@ def _is_blocked(page):
 
 
 def _get_links(query):
-    search_engine = os.getenv('HOWDOI_SEARCH_ENGINE', 'google')
-    search_url = _get_search_url(search_engine).format(URL, url_quote(query))
-
-    logging.info('Searching %s with URL: %s', search_engine, search_url)
-
-    try:
-        result = _get_result(search_url)
-    except requests.HTTPError:
-        logging.info('Received HTTPError')
-        result = None
-    if not result or _is_blocked(result):
-        logging.error('%sUnable to find an answer because the search engine temporarily blocked the request. '
-                      'Attempting to use a different search engine.%s', RED, END_FORMAT)
-        raise BlockError('Temporary block by search engine')
-
-    html = pq(result)
-    links = _extract_links(html, search_engine)
-    if len(links) == 0:
-        logging.info('Search engine %s found no StackOverflow links, returned HTML is:', search_engine)
-        logging.info(result)
+    # Search StackOverflow through the official API instead of scraping a search
+    # engine, which now blocks non-browser clients.
+    data = _se_api('search/advanced',
+                   {'order': 'desc', 'sort': 'relevance', 'q': query,
+                    'site': 'stackoverflow', 'pagesize': '10'})
+    links = [item['link'] for item in data.get('items', []) if item.get('is_answered')]
     return list(dict.fromkeys(links))  # remove any duplicates
 
 
@@ -492,11 +525,11 @@ def _is_help_query(query):
 
 
 def _format_answers(args, res):
-    if "error" in res:
-        return f'ERROR: {RED}{res["error"]}{END_FORMAT}'
-
     if args["json_output"]:
         return json.dumps(res)
+
+    if "error" in res:
+        return f'ERROR: {RED}{res["error"]}{END_FORMAT}'
 
     formatted_answers = []
 
@@ -576,13 +609,22 @@ def _stash_remove(cmd_key, title):
 
 
 def _stash_save(cmd_key, title, answer):
-    try:
-        keep_utils.save_command(cmd_key, answer, title)
-    except FileNotFoundError:
-        os.system('keep init')
-        keep_utils.save_command(cmd_key, answer, title)
-    finally:
-        print_stash()
+    os.makedirs(keep_utils.dir_path, exist_ok=True)
+    keep_utils.save_command(cmd_key, answer, title)
+    print_stash()
+
+
+def _stash_empty():
+    commands = keep_utils.read_commands()
+    if not commands:
+        logging.error('%sNo commands found in stash. '
+                      'Add a command with "howdoi --%s <query>".%s', RED, STASH_SAVE, END_FORMAT)
+        return
+    prompt = f'{BOLD}> Empty the entire stash? [y/N]: {END_FORMAT}'
+    if input(prompt).strip().lower() not in ('y', 'yes'):
+        return
+    keep_utils.write_commands({})
+    print(f'\n{BOLD}{GREEN}Stash emptied{END_FORMAT}\n')
 
 
 def _parse_cmd(args, res):
@@ -791,7 +833,7 @@ def command_line_runner():  # pylint: disable=too-many-return-statements,too-man
         return
 
     if args[STASH_EMPTY]:
-        os.system('keep init')
+        _stash_empty()
         return
 
     if args[STASH_REMOVE] and len(args['query']) == 0:

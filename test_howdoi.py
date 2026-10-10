@@ -9,7 +9,6 @@ import unittest
 
 from pathlib import Path
 from unittest.mock import patch
-import requests
 
 from cachelib import NullCache
 from pyquery import PyQuery as pq
@@ -106,11 +105,10 @@ class HowdoiTestCase(unittest.TestCase):  # pylint: disable=too-many-public-meth
         self.assertEqual(howdoi.get_link_at_pos(['/questions/42/', '/questions/142/'], 1),
                          '/questions/42/')
 
-    @patch.object(howdoi, '_get_result')
-    def test_blockerror(self, mock_get_links):
-        mock_get_links.side_effect = requests.HTTPError
+    def test_blockerror(self):
         query = self.queries[0]
-        response = howdoi.howdoi(query)
+        with patch.object(howdoi, '_get_links', side_effect=howdoi.BlockError):
+            response = howdoi.howdoi(query)
         self.assertEqual(response, "ERROR: \x1b[91mUnable to get a response from any search engine\n\x1b[0m")
 
     def test_answers(self):
@@ -183,6 +181,12 @@ class HowdoiTestCase(unittest.TestCase):  # pylint: disable=too-many-public-meth
         self.assertEqual(json_answer["answer"], txt_answer)
         self.assertEqual(json_answer["link"], link_answer)
         self.assertEqual(json_answer["position"], 1)
+
+    def test_json_output_error(self):
+        query = self.queries[0]
+        with patch.object(howdoi, '_get_links', return_value=[]):
+            json_answer = howdoi.howdoi(query + ' -j')
+        self.assertIn("error", json.loads(json_answer))
 
     def test_multiple_answers(self):
         query = self.queries[0]
