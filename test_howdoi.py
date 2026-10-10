@@ -188,6 +188,22 @@ class HowdoiTestCase(unittest.TestCase):  # pylint: disable=too-many-public-meth
             json_answer = howdoi.howdoi(query + ' -j')
         self.assertIn("error", json.loads(json_answer))
 
+    def test_tavily_fallback(self):
+        class _FakeResponse:
+            def raise_for_status(self):
+                return None
+
+            def json(self):
+                return {'results': [
+                    {'url': 'https://stackoverflow.com/questions/42/how-to'},
+                    {'url': 'https://example.com/not-a-question'},
+                ]}
+
+        with patch.object(howdoi, '_se_api', return_value={}), \
+                patch.object(howdoi.howdoi_session, 'post', return_value=_FakeResponse()):
+            links = howdoi._get_links(self.queries[0])
+        self.assertEqual(links, ['https://stackoverflow.com/questions/42/how-to'])
+
     def test_multiple_answers(self):
         query = self.queries[0]
         first_answer = howdoi.howdoi(query)

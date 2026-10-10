@@ -325,6 +325,29 @@ def _is_blocked(page):
     return False
 
 
+def _is_stackoverflow_question(url):
+    parsed = urlparse(url)
+    return parsed.netloc.endswith('stackoverflow.com') and '/questions/' in parsed.path
+
+
+def _tavily_links(query):
+    # Fall back to a web search when the StackExchange API search finds nothing.
+    # Tavily's keyless mode needs no account or API key.
+    try:
+        resp = howdoi_session.post(
+            'https://api.tavily.com/search',
+            json={'query': 'site:stackoverflow.com ' + query, 'max_results': 10},
+            headers={'X-Tavily-Access-Mode': 'keyless'},
+            proxies=get_proxies(),
+            timeout=30)
+        resp.raise_for_status()
+    except requests.exceptions.RequestException:
+        logging.info('Tavily fallback search failed')
+        return []
+    return [item['url'] for item in resp.json().get('results', [])
+            if _is_stackoverflow_question(item.get('url', ''))]
+
+
 def _get_links(query):
     # Search StackOverflow through the official API instead of scraping a search
     # engine, which now blocks non-browser clients.
@@ -332,7 +355,11 @@ def _get_links(query):
                    {'order': 'desc', 'sort': 'relevance', 'q': query,
                     'site': 'stackoverflow', 'pagesize': '10'})
     links = [item['link'] for item in data.get('items', []) if item.get('is_answered')]
-    return list(dict.fromkeys(links))  # remove any duplicates
+    links = list(dict.fromkeys(links))  # remove any duplicates
+    if not links:
+        logging.info('StackExchange API search found no answers; trying Tavily fallback')
+        links = _tavily_links(query)
+    return links
 
 
 def get_link_at_pos(links, position):
